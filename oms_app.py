@@ -8,8 +8,9 @@ import email
 from bs4 import BeautifulSoup
 import re
 import streamlit.components.v1 as components
+import plotly.express as px  # <--- เพิ่ม Library กราฟ
 
-# --- 1. SET PAGE CONFIG (บรรทัดแรกสุด) ---
+# --- 1. SET PAGE CONFIG ---
 st.set_page_config(page_title="Cloud OMS", layout="wide", page_icon="☁️")
 
 # --- CONFIGURATION ---
@@ -38,8 +39,17 @@ def load_orders():
         worksheet = sh.worksheet("orders")
         data = worksheet.get_all_records()
         df = pd.DataFrame(data)
+        
+        # --- CLEANING DATA (จุดแก้สำคัญ) ---
+        # 1. ลบช่องว่างหัวตาราง (เผื่อพิมพ์เว้นวรรคมา)
+        df.columns = df.columns.str.strip()
+        
+        # 2. ถมค่าว่างด้วย string ว่าง (ป้องกัน Error NaN)
+        df.fillna("", inplace=True)
+        
         return df
     except Exception as e:
+        st.error(f"โหลดข้อมูลไม่ได้: {e}")
         return pd.DataFrame()
 
 def save_new_order(order_data):
@@ -113,12 +123,16 @@ def sync_emails():
                 if html_body:
                     soup = BeautifulSoup(html_body, "lxml")
                     text = soup.get_text()
+                    
+                    # Regex Pattern (Food Market Hub)
                     order_match = re.search(r"(SO-\d+-\d+)", text)
                     if not order_match: continue
                     order_id = order_match.group(1)
                     
                     customer = "Food Market Customer"
                     cust_match = re.search(r"received from\s(.*?)\swith order no", text)
+                    if not cust_match:
+                         cust_match = re.search(r"(.*?)\shas placed a new order", text)
                     if cust_match: customer = cust_match.group(1).strip()
                     
                     total = 0.0
@@ -157,28 +171,58 @@ if st.sidebar.button("🔄 Sync & Refresh", type="primary"):
             st.sidebar.info("ยังไม่มีออเดอร์ใหม่")
         st.rerun()
 
+# โหลดข้อมูล
 df = load_orders()
 
 if not df.empty:
-    # Clean Data
+    # --- Data Prep ---
     try:
         df['total_amount'] = df['total_amount'].astype(str).str.replace(',', '', regex=True)
         df['total_amount'] = pd.to_numeric(df['total_amount'], errors='coerce').fillna(0)
         df['delivery_datetime'] = pd.to_datetime(df['delivery_datetime'], errors='coerce')
+        # แปลงวันที่สั่งซื้อเพื่อให้พล็อตกราฟได้
+        df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce').dt.date
     except: pass
 
-    # Dashboard
+    # --- Dashboard Section ---
     st.title("📊 Dashboard (Online)")
+    
+    # 1. Metrics (การ์ดตัวเลข)
     total_sales = df['total_amount'].sum()
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total Orders", f"{len(df)} ใบ")
-    c2.metric("Total Sales", f"฿{total_sales:,.2f}")
+    c1.metric("📦 Total Orders", f"{len(df)} ใบ")
+    c2.metric("💰 Total Sales", f"฿{total_sales:,.2f}")
     if 'status' in df.columns:
-        c3.metric("Pending", len(df[df['status']=='Pending']), delta_color="inverse")
+        c3.metric("⏳ Pending", len(df[df['status']=='Pending']), delta_color="inverse")
     
     st.divider()
 
-    # --- ส่วนจัดการ Tabs (จุดที่แก้ Bug) ---
+    # 2. Graphs (กราฟ)
+    col_g1, col_g2 = st.columns([2, 1])
+    
+    with col_g1:
+        # กราฟยอดขายรายวัน
+        daily_sales = df.groupby('order_date')['total_amount'].sum().reset_index()
+        fig_bar = px.bar(daily_sales, x='order_date', y='total_amount', 
+                         title="📈 ยอดขายรายวัน (Daily Sales)", 
+                         labels={'total_amount': 'ยอดขาย (บาท)', 'order_date': 'วันที่'},
+                         color_discrete_sequence=['#FF9F36'])
+        st.plotly_chart(fig_bar, use_container_width=True)
+        
+    with col_g2:
+        # กราฟสัดส่วนสถานะ
+        if 'status' in df.columns:
+            status_counts = df['status'].value_counts().reset_index()
+            status_counts.columns = ['Status', 'Count']
+            fig_pie = px.pie(status_counts, values='Count', names='Status', 
+                             title="🍰 สถานะออเดอร์",
+                             hole=0.4,
+                             color_discrete_sequence=px.colors.qualitative.Pastel)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+    st.divider()
+
+    # --- Order Management Tabs ---
     tab1, tab2, tab3 = st.tabs(["📝 Pending", "🚚 Shipped", "❌ Canceled"])
     
     def render_tab(status_filter, tab_key):
@@ -190,10 +234,9 @@ if not df.empty:
             st.info("ไม่มีรายการ")
             return
 
-        # 1. แสดงตาราง Data Editor
+        # ตารางรายการ
         st.write("##### ✅ เลือกรายการ:")
         df_show = filtered_df.copy()
-        # สร้าง Column สำรองถ้าไม่มี
         if 'total_amount' not in df_show.columns: df_show['total_amount'] = 0.0
         
         df_display = df_show[['order_id', 'customer', 'total_amount']].reset_index(drop=True)
@@ -210,13 +253,11 @@ if not df.empty:
             hide_index=True
         )
         
-        # 2. ปุ่มจัดการ (ต้องอยู่นอก Loop 100%)
+        # ปุ่มดำเนินการ (อยู่นอก Loop)
         col_act = st.columns([2, 1])
         with col_act[0]:
-            # จุดสำคัญ: selectbox นี้จะถูกสร้างแค่ครั้งเดียวต่อ 1 Tab
             new_st = st.selectbox("เปลี่ยนสถานะ:", ["Pending", "Shipped", "Canceled"], key=f"sel_{tab_key}")
         with col_act[1]:
-            # ปุ่มกด
             if st.button(f"บันทึก ({tab_key})", key=f"btn_{tab_key}", type="primary"):
                 ids = edited_df[edited_df.Select]['order_id'].tolist()
                 if ids:
@@ -227,20 +268,36 @@ if not df.empty:
                 else:
                     st.toast("กรุณาเลือกรายการ")
 
-        # 3. แสดงการ์ดรายละเอียด (Loop อยู่ตรงนี้)
+        # การ์ดแสดงรายละเอียด
         st.divider()
         st.caption("คลิกเพื่อดูบิล")
         for idx, row in filtered_df.iterrows():
-            with st.expander(f"{row['order_id']} | {row['customer']} | ฿{row['total_amount']:,.2f}"):
-                if 'raw_html' in row and row['raw_html']:
-                    components.html(row['raw_html'], height=600, scrolling=True)
+            # เช็คว่ามีข้อมูลบิลหรือไม่ (แก้ Logic ให้แม่นยำขึ้น)
+            raw_html_content = str(row.get('raw_html', '')).strip()
+            has_bill = len(raw_html_content) > 20 # ถ้ามีตัวอักษรเกิน 20 ตัว ถือว่ามีบิล
+            
+            icon = "📄" if has_bill else "⚠️"
+            
+            with st.expander(f"{icon} {row['order_id']} | {row['customer']} | ฿{row['total_amount']:,.2f}"):
+                if has_bill:
+                    components.html(raw_html_content, height=600, scrolling=True)
                 else:
-                    st.warning("ไม่พบรูปบิล")
+                    st.warning("ไม่พบโค้ดบิล (HTML) ในฐานข้อมูล")
+                    # Debug: แสดงข้อมูลดิบเผื่อเช็ค
+                    with st.expander("ดูข้อมูลดิบ (สำหรับตรวจสอบ)"):
+                        st.code(raw_html_content)
 
-    # เรียกใช้งาน
+    # Render Tabs
     with tab1: render_tab("Pending", "t1")
     with tab2: render_tab("Shipped", "t2")
     with tab3: render_tab("Canceled", "t3")
+    
+    # --- Debug Helper (ซ่อนอยู่ล่างสุด) ---
+    with st.expander("🛠️ Debug Data (สำหรับนักพัฒนา)"):
+        st.write("นี่คือข้อมูล 5 แถวแรกที่โปรแกรมอ่านได้จาก Google Sheet:")
+        st.dataframe(df.head())
+        st.write("รายชื่อคอลัมน์:", df.columns.tolist())
 
 else:
-    st.warning("⚠️ ไม่พบข้อมูล หรือยังไม่ได้เชื่อมต่อ Google Sheets")
+    st.warning("⚠️ ไม่พบข้อมูล หรือเชื่อมต่อ Google Sheets ไม่ได้")
+    st.info("ลองกดปุ่ม Sync ด้านซ้ายมือเพื่อดึงข้อมูลใหม่")

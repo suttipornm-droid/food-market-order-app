@@ -8,10 +8,10 @@ import email
 from bs4 import BeautifulSoup
 import re
 import streamlit.components.v1 as components
-import plotly.express as px  # <--- เพิ่ม Library กราฟ
+import plotly.express as px
 
 # --- 1. SET PAGE CONFIG ---
-st.set_page_config(page_title="Cloud OMS", layout="wide", page_icon="☁️")
+st.set_page_config(page_title="Cloud OMS Pro", layout="wide", page_icon="📦")
 
 # --- CONFIGURATION ---
 IMAP_SERVER = "imap.gmail.com"
@@ -21,7 +21,7 @@ SHEET_NAME = "MyOrderDB"
 def get_db_connection():
     try:
         if "gcp_service_account" not in st.secrets:
-            st.error("ไม่พบ Secrets 'gcp_service_account'")
+            st.error("❌ ไม่พบ Secrets 'gcp_service_account'")
             return None
         creds_dict = dict(st.secrets["gcp_service_account"])
         client = gspread.service_account_from_dict(creds_dict)
@@ -40,13 +40,16 @@ def load_orders():
         data = worksheet.get_all_records()
         df = pd.DataFrame(data)
         
-        # --- CLEANING DATA (จุดแก้สำคัญ) ---
-        # 1. ลบช่องว่างหัวตาราง (เผื่อพิมพ์เว้นวรรคมา)
+        # Clean Columns
         df.columns = df.columns.str.strip()
         
-        # 2. ถมค่าว่างด้วย string ว่าง (ป้องกัน Error NaN)
+        # Handle Missing Columns (ถ้าลืมเพิ่มใน Sheet จะได้ไม่ Error)
+        for col in ['requested_date', 'remarks', 'total_qty', 'raw_html']:
+            if col not in df.columns:
+                df[col] = ""
+
+        # Fill NaN
         df.fillna("", inplace=True)
-        
         return df
     except Exception as e:
         st.error(f"โหลดข้อมูลไม่ได้: {e}")
@@ -59,9 +62,11 @@ def save_new_order(order_data):
         ws = sh.worksheet("orders")
         try:
             cell = ws.find(str(order_data['order_id']))
-            if cell: return False 
+            if cell: return False # Duplicate
         except:
             pass 
+        
+        # เรียงข้อมูลให้ตรงกับหัวตาราง
         row = [
             str(order_data['order_id']),
             order_data['customer'],
@@ -69,11 +74,15 @@ def save_new_order(order_data):
             str(order_data['delivery_datetime']),
             order_data['total_amount'],
             "Pending",
-            order_data['raw_html']
+            order_data['raw_html'],
+            order_data['requested_date'], # New
+            order_data['remarks'],        # New
+            order_data['total_qty']       # New
         ]
         ws.append_row(row)
         return True
-    except Exception:
+    except Exception as e:
+        print(f"Save Error: {e}")
         return False
 
 def update_status(order_ids, new_status):
@@ -83,8 +92,10 @@ def update_status(order_ids, new_status):
         ws = sh.worksheet("orders")
         log_ws = sh.worksheet("logs")
         if not isinstance(order_ids, list): order_ids = [order_ids]
+        
         header = ws.row_values(1)
         status_col_idx = header.index('status') + 1
+        
         for oid in order_ids:
             try:
                 cell = ws.find(str(oid))
@@ -95,7 +106,7 @@ def update_status(order_ids, new_status):
     except Exception as e:
         st.error(f"Update Error: {e}")
 
-# --- EMAIL FETCHING ---
+# --- EMAIL FETCHING & PARSING (UPGRADED) ---
 def sync_emails():
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
@@ -104,9 +115,12 @@ def sync_emails():
             return 0
         mail.login(st.secrets["email"]["user"], st.secrets["email"]["password"])
         mail.select("inbox")
+        
         status, messages = mail.search(None, '(FROM "care@foodmarkethub.com")')
         email_ids = messages[0].split()
+        
         new_count = 0
+        # ดึง 10 ฉบับล่าสุด
         for num in email_ids[-10:]:
             try:
                 _, msg_data = mail.fetch(num, "(RFC822)")
@@ -124,39 +138,74 @@ def sync_emails():
                     soup = BeautifulSoup(html_body, "lxml")
                     text = soup.get_text()
                     
-                    # Regex Pattern (Food Market Hub)
+                    # 1. Basic Info
                     order_match = re.search(r"(SO-\d+-\d+)", text)
                     if not order_match: continue
                     order_id = order_match.group(1)
                     
-                    customer = "Food Market Customer"
+                    customer = "Unknown"
                     cust_match = re.search(r"received from\s(.*?)\swith order no", text)
-                    if not cust_match:
-                         cust_match = re.search(r"(.*?)\shas placed a new order", text)
+                    if not cust_match: cust_match = re.search(r"(.*?)\shas placed a new order", text)
                     if cust_match: customer = cust_match.group(1).strip()
                     
                     total = 0.0
                     total_match = re.search(r"Total Amount\s*฿\s*([\d,]+\.?\d*)", text)
                     if total_match: 
-                        clean_num = re.sub(r'[^\d.]', '', total_match.group(1))
-                        total = float(clean_num)
+                        total = float(re.sub(r'[^\d.]', '', total_match.group(1)))
                     
+                    # 2. New Fields Extraction
+                    # Requested Delivery Date
+                    req_date = ""
+                    req_match = re.search(r"Requested Delivery Date:\s*(.*)", text)
+                    if req_match: req_date = req_match.group(1).strip()
+                    
+                    # Remarks
+                    remarks = ""
+                    rem_match = re.search(r"Remarks:\s*(.*)", text)
+                    if rem_match: remarks = rem_match.group(1).strip()
+
+                    # 3. Calculate Total Qty (Parse Table)
+                    total_qty = 0
+                    try:
+                        tables = soup.find_all("table")
+                        for table in tables:
+                            rows = table.find_all("tr")
+                            if not rows: continue
+                            # หาหัวตาราง
+                            headers = [th.get_text(strip=True).lower() for th in rows[0].find_all(["th", "td"])]
+                            if "qty" in headers:
+                                qty_idx = headers.index("qty")
+                                for row in rows[1:]:
+                                    cols = row.find_all("td")
+                                    if len(cols) > qty_idx:
+                                        val = cols[qty_idx].get_text(strip=True)
+                                        try:
+                                            total_qty += float(re.sub(r'[^\d.]', '', val))
+                                        except: pass
+                                break # เจอแล้วหยุด
+                    except: pass
+                    
+                    # Default Delivery Date
                     delivery_dt = datetime.datetime.now() + timedelta(days=1) 
+
                     order_data = {
                         'order_id': order_id,
                         'customer': customer,
                         'order_date': datetime.date.today(),
                         'delivery_datetime': delivery_dt,
                         'total_amount': total,
-                        'raw_html': html_body
+                        'raw_html': html_body,
+                        'requested_date': req_date,
+                        'remarks': remarks,
+                        'total_qty': total_qty
                     }
+                    
                     if save_new_order(order_data):
                         new_count += 1
             except: continue
         mail.logout()
         return new_count
-    except Exception:
-        return 0
+    except Exception: return 0
 
 # --- MAIN UI ---
 st.sidebar.title("☁️ Cloud Order System")
@@ -171,133 +220,122 @@ if st.sidebar.button("🔄 Sync & Refresh", type="primary"):
             st.sidebar.info("ยังไม่มีออเดอร์ใหม่")
         st.rerun()
 
-# โหลดข้อมูล
 df = load_orders()
 
 if not df.empty:
-    # --- Data Prep ---
+    # Data Prep
     try:
         df['total_amount'] = df['total_amount'].astype(str).str.replace(',', '', regex=True)
         df['total_amount'] = pd.to_numeric(df['total_amount'], errors='coerce').fillna(0)
-        df['delivery_datetime'] = pd.to_datetime(df['delivery_datetime'], errors='coerce')
-        # แปลงวันที่สั่งซื้อเพื่อให้พล็อตกราฟได้
         df['order_date'] = pd.to_datetime(df['order_date'], errors='coerce').dt.date
+        if 'total_qty' in df.columns:
+            df['total_qty'] = pd.to_numeric(df['total_qty'], errors='coerce').fillna(0)
     except: pass
 
-    # --- Dashboard Section ---
-    st.title("📊 Dashboard (Online)")
+    st.title("📊 Dashboard")
     
-    # 1. Metrics (การ์ดตัวเลข)
-    total_sales = df['total_amount'].sum()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("📦 Total Orders", f"{len(df)} ใบ")
-    c2.metric("💰 Total Sales", f"฿{total_sales:,.2f}")
+    # 1. Metrics Updated
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📦 Total Orders", f"{len(df)}")
+    c2.metric("💰 Total Sales", f"฿{df['total_amount'].sum():,.0f}")
+    c3.metric("🔢 Total Items (Qty)", f"{df['total_qty'].sum():,.0f} ชิ้น")
     if 'status' in df.columns:
-        c3.metric("⏳ Pending", len(df[df['status']=='Pending']), delta_color="inverse")
+        c4.metric("⏳ Pending", len(df[df['status']=='Pending']), delta_color="inverse")
     
     st.divider()
 
-    # 2. Graphs (กราฟ)
-    col_g1, col_g2 = st.columns([2, 1])
-    
-    with col_g1:
-        # กราฟยอดขายรายวัน
-        daily_sales = df.groupby('order_date')['total_amount'].sum().reset_index()
-        fig_bar = px.bar(daily_sales, x='order_date', y='total_amount', 
-                         title="📈 ยอดขายรายวัน (Daily Sales)", 
-                         labels={'total_amount': 'ยอดขาย (บาท)', 'order_date': 'วันที่'},
-                         color_discrete_sequence=['#FF9F36'])
-        st.plotly_chart(fig_bar, use_container_width=True)
-        
-    with col_g2:
-        # กราฟสัดส่วนสถานะ
+    # 2. Graphs
+    g1, g2 = st.columns([2, 1])
+    with g1:
+        daily = df.groupby('order_date')['total_amount'].sum().reset_index()
+        fig = px.bar(daily, x='order_date', y='total_amount', title="ยอดขายรายวัน", color_discrete_sequence=['#36A2EB'])
+        st.plotly_chart(fig, use_container_width=True)
+    with g2:
         if 'status' in df.columns:
-            status_counts = df['status'].value_counts().reset_index()
-            status_counts.columns = ['Status', 'Count']
-            fig_pie = px.pie(status_counts, values='Count', names='Status', 
-                             title="🍰 สถานะออเดอร์",
-                             hole=0.4,
-                             color_discrete_sequence=px.colors.qualitative.Pastel)
-            st.plotly_chart(fig_pie, use_container_width=True)
+            status_c = df['status'].value_counts().reset_index()
+            status_c.columns = ['Status', 'Count']
+            fig2 = px.pie(status_c, values='Count', names='Status', title="สัดส่วนสถานะ", hole=0.4)
+            st.plotly_chart(fig2, use_container_width=True)
 
     st.divider()
 
-    # --- Order Management Tabs ---
+    # --- Order Management ---
     tab1, tab2, tab3 = st.tabs(["📝 Pending", "🚚 Shipped", "❌ Canceled"])
     
     def render_tab(status_filter, tab_key):
         if 'status' not in df.columns: return
-        
         filtered_df = df[df['status'] == status_filter]
         
         if filtered_df.empty:
             st.info("ไม่มีรายการ")
             return
 
-        # ตารางรายการ
-        st.write("##### ✅ เลือกรายการ:")
+        # TABLE UI
+        st.write(f"##### ✅ รายการ ({len(filtered_df)})")
         df_show = filtered_df.copy()
-        if 'total_amount' not in df_show.columns: df_show['total_amount'] = 0.0
+        df_show.insert(0, "Select", False)
         
-        df_display = df_show[['order_id', 'customer', 'total_amount']].reset_index(drop=True)
-        df_display.insert(0, "Select", False)
+        # แสดงคอลัมน์ใหม่ในตาราง
+        cols_config = {
+            "Select": st.column_config.CheckboxColumn("เลือก", width="small"),
+            "order_id": st.column_config.TextColumn("Order No."),
+            "customer": st.column_config.TextColumn("Customer"),
+            "requested_date": st.column_config.TextColumn("Req. Date"), # New
+            "total_qty": st.column_config.NumberColumn("Qty", format="%d"), # New
+            "total_amount": st.column_config.NumberColumn("Total", format="฿ %.2f")
+        }
         
+        # เลือกเฉพาะคอลัมน์ที่มีจริง
+        display_cols = ['Select', 'order_id', 'customer', 'requested_date', 'total_qty', 'total_amount']
+        display_cols = [c for c in display_cols if c in df_show.columns]
+
         edited_df = st.data_editor(
-            df_display,
-            column_config={
-                "Select": st.column_config.CheckboxColumn("เลือก", default=False, width="small"),
-                "total_amount": st.column_config.NumberColumn("ยอดเงิน", format="฿ %.2f")
-            },
+            df_show[display_cols],
+            column_config=cols_config,
             key=f"editor_{tab_key}",
             use_container_width=True,
             hide_index=True
         )
         
-        # ปุ่มดำเนินการ (อยู่นอก Loop)
-        col_act = st.columns([2, 1])
-        with col_act[0]:
+        # BUTTONS
+        c_act = st.columns([2, 1])
+        with c_act[0]:
             new_st = st.selectbox("เปลี่ยนสถานะ:", ["Pending", "Shipped", "Canceled"], key=f"sel_{tab_key}")
-        with col_act[1]:
-            if st.button(f"บันทึก ({tab_key})", key=f"btn_{tab_key}", type="primary"):
+        with c_act[1]:
+            if st.button(f"บันทึกสถานะ", key=f"btn_{tab_key}", type="primary"):
                 ids = edited_df[edited_df.Select]['order_id'].tolist()
                 if ids:
                     update_status(ids, new_st)
                     st.toast("บันทึกสำเร็จ!")
                     st.cache_data.clear()
                     st.rerun()
-                else:
-                    st.toast("กรุณาเลือกรายการ")
 
-        # การ์ดแสดงรายละเอียด
-        st.divider()
-        st.caption("คลิกเพื่อดูบิล")
+        # DETAILS CARDS
+        st.write("---")
         for idx, row in filtered_df.iterrows():
-            # เช็คว่ามีข้อมูลบิลหรือไม่ (แก้ Logic ให้แม่นยำขึ้น)
-            raw_html_content = str(row.get('raw_html', '')).strip()
-            has_bill = len(raw_html_content) > 20 # ถ้ามีตัวอักษรเกิน 20 ตัว ถือว่ามีบิล
-            
+            # Check bill HTML
+            html_content = str(row.get('raw_html', ''))
+            has_bill = len(html_content) > 50
             icon = "📄" if has_bill else "⚠️"
             
-            with st.expander(f"{icon} {row['order_id']} | {row['customer']} | ฿{row['total_amount']:,.2f}"):
+            # Label
+            label = f"{icon} {row['order_id']} | {row['customer']} | Qty: {row.get('total_qty',0)} | ฿{row['total_amount']:,.2f}"
+            
+            with st.expander(label):
+                c_info1, c_info2 = st.columns(2)
+                with c_info1:
+                    st.markdown(f"**Requested Date:** {row.get('requested_date', '-')}")
+                    st.markdown(f"**Remarks:** {row.get('remarks', '-')}")
+                
                 if has_bill:
-                    components.html(raw_html_content, height=600, scrolling=True)
+                    components.html(html_content, height=600, scrolling=True)
                 else:
-                    st.warning("ไม่พบโค้ดบิล (HTML) ในฐานข้อมูล")
-                    # Debug: แสดงข้อมูลดิบเผื่อเช็ค
-                    with st.expander("ดูข้อมูลดิบ (สำหรับตรวจสอบ)"):
-                        st.code(raw_html_content)
+                    st.warning("ไม่พบรูปบิล (ลองกด Forward เมลเข้ามาใหม่แล้ว Sync)")
 
-    # Render Tabs
     with tab1: render_tab("Pending", "t1")
     with tab2: render_tab("Shipped", "t2")
     with tab3: render_tab("Canceled", "t3")
-    
-    # --- Debug Helper (ซ่อนอยู่ล่างสุด) ---
-    with st.expander("🛠️ Debug Data (สำหรับนักพัฒนา)"):
-        st.write("นี่คือข้อมูล 5 แถวแรกที่โปรแกรมอ่านได้จาก Google Sheet:")
-        st.dataframe(df.head())
-        st.write("รายชื่อคอลัมน์:", df.columns.tolist())
 
 else:
-    st.warning("⚠️ ไม่พบข้อมูล หรือเชื่อมต่อ Google Sheets ไม่ได้")
-    st.info("ลองกดปุ่ม Sync ด้านซ้ายมือเพื่อดึงข้อมูลใหม่")
+    st.warning("⚠️ ไม่พบข้อมูล")
+    st.info("อย่าลืมเพิ่มคอลัมน์ใน Google Sheets: requested_date, remarks, total_qty")

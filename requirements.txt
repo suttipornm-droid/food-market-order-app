@@ -1,0 +1,7 @@
+streamlit
+pandas
+plotly
+beautifulsoup4
+lxml
+gspread
+google-auth
